@@ -1,0 +1,22 @@
+JP - GOW 3 PS4 Remastered Extractor - License
+Copyright (c) 2026 Gamer JP. All rights reserved.
+
+You MAY:
+  - download and use this tool for free, for personal and non-commercial modding and research;
+  - share mods and work you made with the help of this tool, provided you credit "Gamer JP"
+    (for example "Extracted with JP - GOW 3 PS4 Remastered Extractor by Gamer JP").
+
+You may NOT, without written permission from Gamer JP:
+  - re-upload, mirror or redistribute the tool (original or modified) anywhere else;
+  - sell the tool or include it in a paid product, pack or bundle;
+  - publish modified versions of the tool or present it as your own work.
+
+Please share the link to the official page instead of the files.
+
+Extracted game assets are the property of their owners. Use them for personal modding and research only.
+
+The tool is provided "as is", without warranty of any kind. You use it at your own risk; the author is not
+liable for any damage to your files or system.
+
+God of War is a trademark of Sony Interactive Entertainment LLC. This tool is not affiliated with or endorsed by
+Sony Interactive Entertainment or Santa Monica Studio and contains no game data.
