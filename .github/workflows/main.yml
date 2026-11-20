@@ -15,8 +15,6 @@
           New-Item -ItemType Directory -Force -Path $output | Out-Null
 
           Write-Host "Extractor: $($exe.FullName)"
-          Write-Host "Input: $input"
-          Write-Host "Output: $output"
 
           & $exe.FullName --cli $input $output
 
@@ -24,8 +22,102 @@
 
           $files = Get-ChildItem $output -Recurse -File
 
-          Write-Host "Total file berhasil dibuat: $($files.Count)"
+          Write-Host "Total file: $($files.Count)"
 
           if ($files.Count -eq 0) {
               throw "Tidak ada hasil ekstraksi!"
-          }
+          }name: Extract God of War III Remastered PS4
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: read
+
+jobs:
+extract:
+runs-on: windows-latest
+
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Prepare Input
+    shell: pwsh
+    run: |
+      New-Item -ItemType Directory -Force -Path input_wad, output | Out-Null
+
+      if (!(Test-Path "wad.zip")) {
+          throw "wad.zip tidak ditemukan!"
+      }
+
+      Expand-Archive -Path "wad.zip" -DestinationPath "temp_wad" -Force
+
+      $files = Get-ChildItem "temp_wad" -Recurse -File |
+          Where-Object { $_.Extension -ieq ".wad" }
+
+      if ($files.Count -eq 0) {
+          throw "Tidak ditemukan file WAD!"
+      }
+
+      foreach ($file in $files) {
+          Copy-Item $file.FullName "input_wad/$($file.Name)" -Force
+      }
+
+      Write-Host "WAD ditemukan: $($files.Count)"
+
+  - name: Download Extractor
+    shell: pwsh
+    run: |
+      $api = "https://api.github.com/repos/jpthebaby/GOW-3-PS4-Remastered-Model-Extractor/releases/latest"
+
+      $release = Invoke-RestMethod -Uri $api -Headers @{
+          "User-Agent" = "GitHub-Actions"
+      }
+
+      $asset = $release.assets |
+          Where-Object { $_.name -eq "JPGow3_Extractor_v1.0.zip" } |
+          Select-Object -First 1
+
+      if (!$asset) {
+          throw "Extractor ZIP tidak ditemukan!"
+      }
+
+      Invoke-WebRequest -Uri $asset.browser_download_url -OutFile extractor.zip
+
+      Expand-Archive extractor.zip -DestinationPath extractor -Force
+
+  - name: Run WAD Extractor
+    shell: pwsh
+    run: |
+      $exe = Get-ChildItem "extractor" -Recurse -Filter "*.exe" |
+          Where-Object { $_.Name -eq "JPGow3 Extractor.exe" } |
+          Select-Object -First 1
+
+      if (!$exe) {
+          throw "Extractor tidak ditemukan!"
+      }
+
+      $input = (Resolve-Path "input_wad").Path
+      $output = Join-Path $PWD "output"
+
+      Write-Host "Memulai ekstraksi..."
+
+      & $exe.FullName --cli $input $output
+
+      $files = Get-ChildItem $output -Recurse -File
+
+      Write-Host "Total hasil: $($files.Count)"
+
+      if ($files.Count -eq 0) {
+          throw "Tidak ada hasil ekstraksi!"
+      }
+
+  - name: Upload Results
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: GOW3-PS4-Extracted
+      path: output/
+      if-no-files-found: warn
+      compression-level: 0
+      retention-days: 7
