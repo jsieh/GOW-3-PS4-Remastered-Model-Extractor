@@ -1,4 +1,4 @@
-name: Extract WAD (GoW3 Remastered PS4)
+name: Extract WAD to PNG (GoW3 Remastered PS4)
 
 on:
   workflow_dispatch:
@@ -7,12 +7,16 @@ on:
         description: "Path file zip di branch main"
         required: true
         default: "wad.zip"
+      png_scan:
+        description: "Cari tekstur DDS di dalam WAD lalu convert ke PNG"
+        type: boolean
+        default: true
       setup_cmd:
-        description: "Opsional: persiapan tool, jalan sekali (hasil taruh di $TOOLS_DIR)"
+        description: "Opsional: persiapan tool extractor, jalan sekali (taruh di $TOOLS_DIR)"
         required: false
         default: ""
       extract_cmd:
-        description: 'Perintah ekstraksi per file, tersedia $WAD_FILE, $OUT_DIR, $TOOLS_DIR. Kosong = hanya inspeksi'
+        description: 'Opsional: perintah extractor per file, tersedia $WAD_FILE, $OUT_DIR, $TOOLS_DIR'
         required: false
         default: ""
 
@@ -24,7 +28,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      # Input dilewatkan lewat env, bukan di-interpolasi langsung ke script
       ZIP_PATH: ${{ inputs.zip_path }}
       SETUP_CMD: ${{ inputs.setup_cmd }}
       EXTRACT_CMD: ${{ inputs.extract_cmd }}
@@ -46,9 +49,8 @@ jobs:
             echo "::error::$ZIP_PATH tidak ditemukan di branch main"
             exit 1
           fi
-          # Kalau LFS gagal, file hanya berisi pointer teks kecil
           if [ "$(stat -c%s "$ZIP_PATH")" -lt 1024 ] && grep -q "git-lfs" "$ZIP_PATH"; then
-            echo "::error::$ZIP_PATH masih berupa pointer Git LFS, bukan file asli. Pastikan file di-push lewat LFS dan kuota LFS cukup."
+            echo "::error::$ZIP_PATH masih berupa pointer Git LFS, bukan file asli."
             exit 1
           fi
           ls -lh "$ZIP_PATH"
@@ -60,7 +62,7 @@ jobs:
           set -euo pipefail
           mkdir -p work/wad out "$TOOLS_DIR"
           unzip -q -o "$ZIP_PATH" -d work/wad
-          rm -f "$ZIP_PATH"   # bebaskan ruang disk
+          rm -f "$ZIP_PATH"
           df -h .
 
       - name: Inspeksi file WAD
@@ -85,7 +87,120 @@ jobs:
             echo "| \`${f#work/wad/}\` | $size | \`$magic\` |" >> "$GITHUB_STEP_SUMMARY"
           done
 
-      - name: Setup tool
+      - name: Setup Python
+        if: ${{ inputs.png_scan }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scan DDS dan convert ke PNG
+        if: ${{ inputs.png_scan }}
+        run: |
+          set -euo pipefail
+          pip install --quiet pillow
+          python3 - <<'PY'
+          import io, mmap, os, struct
+          from pathlib import Path
+          from PIL import Image
+
+          # bytes per blok 4x4 untuk format terkompresi
+          FOURCC = {b"DXT1": 8, b"DXT2": 16, b"DXT3": 16, b"DXT4": 16, b"DXT5": 16,
+                    b"ATI1": 8, b"ATI2": 16, b"BC4U": 8, b"BC5U": 16}
+          DXGI_BC = {}
+          for ids, bs in (((70, 71, 72), 8), ((73, 74, 75), 16), ((76, 77, 78), 16),
+                          ((79, 80, 81), 8), ((82, 83, 84), 16), ((94, 95, 96), 16),
+                          ((97, 98, 99), 16)):
+              for i in ids:
+                  DXGI_BC[i] = bs
+          DXGI_RAW = {28: 32, 29: 32, 87: 32, 91: 32, 61: 8}
+
+          def dds_info(m, off):
+              """Return (w, h, mips, header_len, data_len) atau None kalau bukan DDS valid."""
+              if off + 128 > len(m):
+                  return None
+              hsize, _fl, h, w, _pitch, _depth, mips = struct.unpack_from("<7I", m, off + 4)
+              if hsize != 124 or not (1 <= w <= 16384 and 1 <= h <= 16384):
+                  return None
+              mips = max(mips, 1)
+              if mips > 15:
+                  return None
+              pf_size, _pff, fourcc, bits = struct.unpack_from("<II4sI", m, off + 76)
+              if pf_size != 32:
+                  return None
+              hdr, bs, bpp = 128, None, None
+              if fourcc == b"DX10":
+                  if off + 148 > len(m):
+                      return None
+                  dxgi = struct.unpack_from("<I", m, off + 128)[0]
+                  hdr = 148
+                  bs = DXGI_BC.get(dxgi)
+                  if bs is None:
+                      bpp = DXGI_RAW.get(dxgi)
+              elif fourcc in FOURCC:
+                  bs = FOURCC[fourcc]
+              elif fourcc == b"\0\0\0\0" and bits in (8, 16, 24, 32):
+                  bpp = bits
+              if bs is None and bpp is None:
+                  return None
+              total, mw, mh = 0, w, h
+              for _ in range(mips):
+                  if bs:
+                      total += max(1, (mw + 3) // 4) * max(1, (mh + 3) // 4) * bs
+                  else:
+                      total += mw * mh * bpp // 8
+                  mw, mh = max(1, mw // 2), max(1, mh // 2)
+              return w, h, mips, hdr, total
+
+          src, dst = Path("work/wad"), Path("out/png")
+          rows, tot_ok = [], 0
+          wads = sorted(p for p in src.rglob("*") if p.is_file() and p.suffix.lower() == ".wad")
+          for wad in wads:
+              if wad.stat().st_size == 0:
+                  continue
+              rel = wad.relative_to(src).with_suffix("")
+              hits = valid = trunc = ok = bad = 0
+              with open(wad, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                  pos = m.find(b"DDS ")
+                  while pos != -1:
+                      hits += 1
+                      info = dds_info(m, pos)
+                      nxt = pos + 4
+                      if info:
+                          w, h, mips, hdr, dlen = info
+                          end = pos + hdr + dlen
+                          if end > len(m):
+                              trunc += 1
+                          else:
+                              valid += 1
+                              blob = m[pos:end]
+                              out_dir = dst / rel
+                              out_dir.mkdir(parents=True, exist_ok=True)
+                              stem = f"{valid:04d}_{w}x{h}_0x{pos:x}"
+                              (out_dir / f"{stem}.dds").write_bytes(blob)
+                              try:
+                                  Image.open(io.BytesIO(blob)).convert("RGBA").save(out_dir / f"{stem}.png")
+                                  ok += 1
+                              except Exception as e:
+                                  bad += 1
+                                  print(f"  gagal convert {rel}/{stem}: {e}")
+                              nxt = end
+                      pos = m.find(b"DDS ", nxt)
+              tot_ok += ok
+              rows.append((str(rel), hits, valid, trunc, ok, bad))
+              print(f"{rel}: magic={hits} valid={valid} terpotong={trunc} png={ok} gagal={bad}")
+
+          lines = ["### Hasil scan DDS", "",
+                   "| WAD | Magic 'DDS ' | Valid | Terpotong | PNG | Gagal |",
+                   "|---|---|---|---|---|---|"]
+          lines += [f"| `{r[0]}` | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |" for r in rows]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(lines) + "\n")
+          if tot_ok == 0:
+              print("::warning::Tidak ada PNG yang dihasilkan. Lihat tabel di Summary.")
+          PY
+          echo "Total PNG: $(find out/png -name '*.png' 2>/dev/null | wc -l)"
+
+      - name: Setup tool extractor
         run: |
           set -euo pipefail
           echo "$TOOLS_DIR" >> "$GITHUB_PATH"
@@ -95,11 +210,11 @@ jobs:
             echo "setup_cmd kosong, lewati."
           fi
 
-      - name: Ekstrak WAD
+      - name: Ekstrak WAD dengan tool eksternal
         run: |
           set -euo pipefail
           if [ -z "$EXTRACT_CMD" ]; then
-            echo "extract_cmd kosong, ekstraksi dilewati (mode inspeksi)."
+            echo "extract_cmd kosong, lewati."
             exit 0
           fi
           fail=0
@@ -107,11 +222,10 @@ jobs:
           while IFS= read -r -d '' f; do
             rel="${f#work/wad/}"
             export WAD_FILE="$PWD/$f"
-            export OUT_DIR="$PWD/out/${rel%.*}"
+            export OUT_DIR="$PWD/out/raw/${rel%.*}"
             mkdir -p "$OUT_DIR"
             total=$((total + 1))
             echo "::group::$rel"
-            # </dev/null supaya perintah tidak menelan daftar file dari loop
             if ! bash -euo pipefail -c "$EXTRACT_CMD" </dev/null; then
               echo "::warning::GAGAL: $rel"
               fail=$((fail + 1))
@@ -119,14 +233,22 @@ jobs:
             echo "::endgroup::"
           done < <(find work/wad -type f -iname '*.wad' -print0 | sort -z)
           echo "Selesai: $((total - fail))/$total berhasil"
-          echo "Total hasil: $(find out -type f | wc -l) file, $(du -sh out | cut -f1)"
           [ "$fail" -eq 0 ]
 
-      - name: Upload hasil
+      - name: Upload PNG
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gow3r-wad-extracted
-          path: out/
+          name: gow3r-png
+          path: out/png/
           if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload hasil extractor eksternal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gow3r-raw
+          path: out/raw/
+          if-no-files-found: ignore
           retention-days: 3
