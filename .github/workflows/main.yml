@@ -1,32 +1,4 @@
-      - name: Run WAD Extractor
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem "extractor" -Recurse -Filter "*.exe" |
-              Where-Object { $_.Name -eq "JPGow3 Extractor.exe" } |
-              Select-Object -First 1
-
-          if (!$exe) {
-              throw "Extractor tidak ditemukan!"
-          }
-
-          $input = (Resolve-Path "input_wad").Path
-          $output = Join-Path $PWD "output"
-
-          New-Item -ItemType Directory -Force -Path $output | Out-Null
-
-          Write-Host "Extractor: $($exe.FullName)"
-
-          & $exe.FullName --cli $input $output
-
-          Write-Host "Extractor selesai dijalankan."
-
-          $files = Get-ChildItem $output -Recurse -File
-
-          Write-Host "Total file: $($files.Count)"
-
-          if ($files.Count -eq 0) {
-              throw "Tidak ada hasil ekstraksi!"
-          }name: Extract God of War III Remastered PS4
+name: Extract God of War III Remastered PS4
 
 on:
 workflow_dispatch:
