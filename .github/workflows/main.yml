@@ -1,95 +1,132 @@
-name: Extract God of War III Remastered PS4
+name: Extract WAD (GoW3 Remastered PS4)
 
 on:
   workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Path file zip di branch main"
+        required: true
+        default: "wad.zip"
+      setup_cmd:
+        description: "Opsional: persiapan tool, jalan sekali (hasil taruh di $TOOLS_DIR)"
+        required: false
+        default: ""
+      extract_cmd:
+        description: 'Perintah ekstraksi per file, tersedia $WAD_FILE, $OUT_DIR, $TOOLS_DIR. Kosong = hanya inspeksi'
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   extract:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Input dilewatkan lewat env, bukan di-interpolasi langsung ke script
+      ZIP_PATH: ${{ inputs.zip_path }}
+      SETUP_CMD: ${{ inputs.setup_cmd }}
+      EXTRACT_CMD: ${{ inputs.extract_cmd }}
+      TOOLS_DIR: ${{ github.workspace }}/tools
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout wad.zip dari main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          lfs: true
+          sparse-checkout: ${{ inputs.zip_path }}
+          sparse-checkout-cone-mode: false
 
-      - name: Prepare Input
-        shell: pwsh
+      - name: Validasi zip
         run: |
-          New-Item -ItemType Directory -Force -Path input_wad, output | Out-Null
+          set -euo pipefail
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "::error::$ZIP_PATH tidak ditemukan di branch main"
+            exit 1
+          fi
+          # Kalau LFS gagal, file hanya berisi pointer teks kecil
+          if [ "$(stat -c%s "$ZIP_PATH")" -lt 1024 ] && grep -q "git-lfs" "$ZIP_PATH"; then
+            echo "::error::$ZIP_PATH masih berupa pointer Git LFS, bukan file asli. Pastikan file di-push lewat LFS dan kuota LFS cukup."
+            exit 1
+          fi
+          ls -lh "$ZIP_PATH"
+          df -h .
+          unzip -tq "$ZIP_PATH"
 
-          if (!(Test-Path "wad.zip")) {
-              throw "wad.zip tidak ditemukan!"
-          }
-
-          Expand-Archive -Path "wad.zip" -DestinationPath "temp_wad" -Force
-
-          $files = Get-ChildItem "temp_wad" -Recurse -File |
-              Where-Object { $_.Extension -ieq ".wad" }
-
-          if ($files.Count -eq 0) {
-              throw "Tidak ditemukan file WAD!"
-          }
-
-          foreach ($file in $files) {
-              Copy-Item $file.FullName "input_wad/$($file.Name)" -Force
-          }
-
-          Write-Host "WAD ditemukan: $($files.Count)"
-
-      - name: Download Extractor
-        shell: pwsh
+      - name: Unzip
         run: |
-          $api = "https://api.github.com/repos/jpthebaby/GOW-3-PS4-Remastered-Model-Extractor/releases/latest"
+          set -euo pipefail
+          mkdir -p work/wad out "$TOOLS_DIR"
+          unzip -q -o "$ZIP_PATH" -d work/wad
+          rm -f "$ZIP_PATH"   # bebaskan ruang disk
+          df -h .
 
-          $release = Invoke-RestMethod -Uri $api -Headers @{
-              "User-Agent" = "GitHub-Actions"
-          }
-
-          $asset = $release.assets |
-              Where-Object { $_.name -eq "JPGow3_Extractor_v1.0.zip" } |
-              Select-Object -First 1
-
-          if (!$asset) {
-              throw "Extractor ZIP tidak ditemukan!"
-          }
-
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile extractor.zip
-
-          Expand-Archive extractor.zip -DestinationPath extractor -Force
-
-      - name: Run WAD Extractor
-        shell: pwsh
+      - name: Inspeksi file WAD
         run: |
-          $exe = Get-ChildItem "extractor" -Recurse -Filter "*.exe" |
-              Where-Object { $_.Name -eq "JPGow3 Extractor.exe" } |
-              Select-Object -First 1
+          set -euo pipefail
+          mapfile -d '' files < <(find work/wad -type f -iname '*.wad' -print0 | sort -z)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::Tidak ada file .wad di dalam zip"
+            find work/wad -maxdepth 2 | head -50
+            exit 1
+          fi
+          {
+            echo "### File WAD (${#files[@]})"
+            echo ""
+            echo "| File | Ukuran (byte) | 8 byte pertama |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in "${files[@]}"; do
+            size=$(stat -c%s "$f")
+            magic=$(od -An -tx1 -N8 "$f" | tr -d '\n')
+            echo "$f  $size  $magic"
+            echo "| \`${f#work/wad/}\` | $size | \`$magic\` |" >> "$GITHUB_STEP_SUMMARY"
+          done
 
-          if (!$exe) {
-              throw "Extractor tidak ditemukan!"
-          }
+      - name: Setup tool
+        run: |
+          set -euo pipefail
+          echo "$TOOLS_DIR" >> "$GITHUB_PATH"
+          if [ -n "$SETUP_CMD" ]; then
+            bash -euo pipefail -c "$SETUP_CMD"
+          else
+            echo "setup_cmd kosong, lewati."
+          fi
 
-          $inputDir = (Resolve-Path "input_wad").Path
-          $outputDir = Join-Path $PWD "output"
+      - name: Ekstrak WAD
+        run: |
+          set -euo pipefail
+          if [ -z "$EXTRACT_CMD" ]; then
+            echo "extract_cmd kosong, ekstraksi dilewati (mode inspeksi)."
+            exit 0
+          fi
+          fail=0
+          total=0
+          while IFS= read -r -d '' f; do
+            rel="${f#work/wad/}"
+            export WAD_FILE="$PWD/$f"
+            export OUT_DIR="$PWD/out/${rel%.*}"
+            mkdir -p "$OUT_DIR"
+            total=$((total + 1))
+            echo "::group::$rel"
+            # </dev/null supaya perintah tidak menelan daftar file dari loop
+            if ! bash -euo pipefail -c "$EXTRACT_CMD" </dev/null; then
+              echo "::warning::GAGAL: $rel"
+              fail=$((fail + 1))
+            fi
+            echo "::endgroup::"
+          done < <(find work/wad -type f -iname '*.wad' -print0 | sort -z)
+          echo "Selesai: $((total - fail))/$total berhasil"
+          echo "Total hasil: $(find out -type f | wc -l) file, $(du -sh out | cut -f1)"
+          [ "$fail" -eq 0 ]
 
-          Write-Host "Memulai ekstraksi..."
-
-          & $exe.FullName --cli $inputDir $outputDir
-
-          $files = Get-ChildItem $outputDir -Recurse -File
-
-          Write-Host "Total hasil: $($files.Count)"
-
-          if ($files.Count -eq 0) {
-              throw "Tidak ada hasil ekstraksi!"
-          }
-
-      - name: Upload Results
+      - name: Upload hasil
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: GOW3-PS4-Extracted
-          path: output/
+          name: gow3r-wad-extracted
+          path: out/
           if-no-files-found: warn
-          compression-level: 0
-          retention-days: 7
+          retention-days: 3
